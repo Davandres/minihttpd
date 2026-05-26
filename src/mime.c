@@ -1,43 +1,40 @@
 #include "mime.h"
-#include <string.h>
+#include <string.h>   // strrchr, strcmp
 
-// Tabla de tipos MIME
-typedef struct {
-    const char *extension;
-    const char *mime_type;
-} mime_entry;
-
-static const mime_entry mime_types[] = {
+// Tabla de extensiones conocidas
+// Usamos un array de structs — simple, eficiente para pocas entradas
+static const struct {
+    const char *ext;
+    const char *type;
+} mime_table[] = {
     {".html", "text/html"},
-    {".htm", "text/html"},
-    {".css", "text/css"},
-    {".js", "application/javascript"},
-    {".png", "image/png"},
-    {".jpg", "image/jpeg"},
+    {".css",  "text/css"},
+    {".js",   "application/javascript"},
+    {".png",  "image/png"},
+    {".jpg",  "image/jpeg"},
     {".jpeg", "image/jpeg"},
-    {".gif", "image/gif"},
-    {".svg", "image/svg+xml"},
-    {".ico", "image/x-icon"},
-    {".txt", "text/plain"},
-    {".pdf", "application/pdf"},
-    {".json", "application/json"},
-    {".xml", "application/xml"},
-    {NULL, "application/octet-stream"}  // Tipo por defecto
+    {".gif",  "image/gif"},
+    {".ico",  "image/x-icon"},
+    {".txt",  "text/plain"},
 };
 
-const char* get_mime_type(const char *filename) {
-    // Encontrar la última ocurrencia del punto
-    const char *dot = strrchr(filename, '.');
-    if (!dot) {
-        return "application/octet-stream";
-    }
-    
-    // Buscar en la tabla de tipos MIME
-    for (int i = 0; mime_types[i].extension != NULL; i++) {
-        if (strcasecmp(dot, mime_types[i].extension) == 0) {
-            return mime_types[i].mime_type;
+// Número de entradas en la tabla (calculado en tiempo de compilación)
+#define MIME_TABLE_SIZE (sizeof(mime_table) / sizeof(mime_table[0]))
+
+const char *mime_get_type(const char *filename) {
+    if (!filename) return "application/octet-stream";
+
+    // strrchr encuentra la ÚLTIMA ocurrencia de '.'
+    // Así "archivo.min.js" → extensión ".js" correctamente
+    const char *ext = strrchr(filename, '.');
+    if (!ext) return "application/octet-stream";
+
+    for (size_t i = 0; i < MIME_TABLE_SIZE; i++) {
+        if (strcmp(ext, mime_table[i].ext) == 0) {
+            return mime_table[i].type;
         }
     }
-    
+
+    // Tipo desconocido: el navegador lo descargará en vez de renderizarlo
     return "application/octet-stream";
 }
