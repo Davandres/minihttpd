@@ -1,194 +1,231 @@
 #include "http.h"
 #include "files.h"
 #include "mime.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#include <time.h>
+#include <unistd.h>         /* write(), close()   */
+#include <limits.h>         /* PATH_MAX            */
+#include <sys/stat.h>       /* stat(), S_ISDIR()   */
+#include <sys/sendfile.h>   /* sendfile()          */
 
-// Función auxiliar para obtener la fecha actual en formato HTTP
-static void get_http_date(char *buffer, size_t size) {
-    time_t now = time(NULL);
-    struct tm *tm = gmtime(&now);
-    strftime(buffer, size, "%a, %d %b %Y %H:%M:%S GMT", tm);
+/* ─────────────────────────────────────────────────────────────────
+ * HELPERS INTERNOS
+ * ───────────────────────────────────────────────────────────────── */
+
+/* Escribe todos los bytes en fd (write puede enviar menos que size) */
+static void write_all(int fd, const char *buf, size_t size) {
+    size_t sent = 0;
+    while (sent < size) {
+        ssize_t n = write(fd, buf + sent, size - sent);
+        if (n <= 0) break;
+        sent += (size_t)n;
+    }
 }
 
-// Función auxiliar para buscar un header específico
-static const char* find_header(http_request *req, const char *name) {
-    for (int i = 0; i < req->header_count; i++) {
-        const char *header = req->headers[i];
-        size_t name_len = strlen(name);
-        
-        if (strncasecmp(header, name, name_len) == 0 && header[name_len] == ':') {
-            // Saltar el nombre, los dos puntos y los espacios
-            const char *value = header + name_len + 1;
+/* Traduce un código de estado a su texto */
+static const char *status_text(http_status_t s) {
+    switch (s) {
+        case HTTP_200: return "OK";
+        case HTTP_400: return "Bad Request";
+        case HTTP_403: return "Forbidden";
+        case HTTP_404: return "Not Found";
+        case HTTP_405: return "Method Not Allowed";
+        case HTTP_500: return "Internal Server Error";
+        default:       return "Unknown";
+    }
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * PARSING
+ * ───────────────────────────────────────────────────────────────── */
+
+http_status_t http_parse_request(const char *raw, http_request_t *req) {
+    memset(req, 0, sizeof(*req));
+
+    /* --- 1. Validar tamaño total del buffer --- */
+    if (strlen(raw) > MAX_HEADER_LEN) return HTTP_400;
+
+    /* Trabajamos sobre una copia para no modificar el original.
+     *    snprintf SIEMPRE escribe \0 en la posición n-1 como máximo. */
+    char buf[MAX_HEADER_LEN + 1];
+    snprintf(buf, sizeof(buf), "%s", raw);
+
+    /* --- 2. Aislar la Request Line: "METHOD URI HTTP/1.x\r\n" --- */
+    char *line_end = strstr(buf, "\r\n");
+    if (!line_end) return HTTP_400;
+    *line_end = '\0';   /* terminamos la primera línea aquí */
+
+    /* Extraemos los tres tokens de la request line.
+     * Los anchos en sscanf previenen buffer overflow:
+     *   %15s  → máximo 15 chars + \0 → cabe en method[MAX_METHOD_LEN=16]
+     *   %2047s → máximo 2047 chars + \0 → cabe en uri[MAX_URI_LEN=2048] */
+    char method[MAX_METHOD_LEN];
+    char uri[MAX_URI_LEN];
+    char version[16];
+
+    if (sscanf(buf, "%15s %2047s %15s", method, uri, version) != 3)
+        return HTTP_400;
+
+    /* --- 3. Validar método --- */
+    if (strcmp(method, "GET") != 0) return HTTP_405;
+
+    /* --- 4. Validar URI --- */
+    if (strlen(uri) >= MAX_URI_LEN) return HTTP_400;
+    if (uri[0] != '/')              return HTTP_400;
+
+    snprintf(req->method, sizeof(req->method), "%s", method);
+    snprintf(req->uri,    sizeof(req->uri),    "%s", uri);
+
+    /* --- 5. Parsear headers línea por línea --- */
+    char *ptr = line_end + 2;   /* +2 salta el \r\n de la request line */
+
+    while (*ptr && *ptr != '\r') {  /* línea vacía (\r\n) = fin de headers */
+        char *end = strstr(ptr, "\r\n");
+        if (!end) break;
+        *end = '\0';    /* aislamos el header actual */
+
+        /* Separamos "Nombre: valor" */
+        char *colon = strchr(ptr, ':');
+        if (colon) {
+            *colon     = '\0';
+            char *name  = ptr;
+            char *value = colon + 1;
+
+            /* Saltar espacios al inicio del valor */
             while (*value == ' ') value++;
-            return value;
+
+            /* snprintf en lugar de strncpy para cada header */
+            if (strcasecmp(name, "Host") == 0)
+                snprintf(req->host, sizeof(req->host), "%s", value);
+            else if (strcasecmp(name, "Connection") == 0)
+                snprintf(req->connection, sizeof(req->connection), "%s", value);
         }
+
+        ptr = end + 2;  /* avanzamos al siguiente header */
     }
-    return NULL;
+
+    return HTTP_200;
 }
 
-int parse_http_request(const char *raw_request, http_request *req) {
-    if (!raw_request || !req) return -1;
-    
-    // Inicializar la estructura
-    memset(req, 0, sizeof(http_request));
-    
-    // Verificar tamaño máximo
-    if (strlen(raw_request) > MAX_REQUEST_SIZE) {
-        return -1;  // 400 Bad Request
-    }
-    
-    // Copiar la solicitud para trabajar con ella
-    char request_copy[MAX_REQUEST_SIZE];
-    strncpy(request_copy, raw_request, MAX_REQUEST_SIZE - 1);
-    request_copy[MAX_REQUEST_SIZE - 1] = '\0';
-    
-    // Separar líneas
-    char *saveptr1, *line;
-    int line_number = 0;
-    
-    // Parsear la línea de solicitud
-    line = strtok_r(request_copy, "\r\n", &saveptr1);
-    if (!line) return -1;
-    
-    // Parsear método, URI y versión
-    char method[16], uri[MAX_URI_LENGTH], version[16];
-    if (sscanf(line, "%15s %2047s %15s", method, uri, version) != 3) {
-        return -1;
-    }
-    
-    // Verificar longitud de la URI
-    if (strlen(uri) > MAX_URI_LENGTH) {
-        return -1;
-    }
-    
-    // Verificar método
-    if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0) {
-        strcpy(req->method, method);  // Guardar para manejar error 405
-        return -2;  // Method Not Allowed
-    }
-    
-    // Guardar datos de la solicitud
-    strncpy(req->method, method, MAX_METHOD_LENGTH - 1);
-    strncpy(req->uri, uri, MAX_URI_LENGTH - 1);
-    strncpy(req->version, version, sizeof(req->version) - 1);
-    
-    // Parsear headers
-    while ((line = strtok_r(NULL, "\r\n", &saveptr1)) != NULL) {
-        if (strlen(line) == 0) break;  // Línea vacía = fin de headers
-        
-        if (req->header_count >= MAX_HEADERS) {
-            return -1;  // Demasiados headers
-        }
-        
-        if (strlen(line) > MAX_HEADER_LENGTH) {
-            return -1;  // Header demasiado largo
-        }
-        
-        strncpy(req->headers[req->header_count], line, MAX_HEADER_LENGTH - 1);
-        req->headers[req->header_count][MAX_HEADER_LENGTH - 1] = '\0';
-        req->header_count++;
-    }
-    
-    return 0;
+/* ─────────────────────────────────────────────────────────────────
+ * RESPUESTA DE ERROR
+ * ───────────────────────────────────────────────────────────────── */
+
+void http_send_error(int fd, http_status_t status) {
+    const char *text = status_text(status);
+
+    /* snprintf (nunca sprintf) — tamaño fijo, sin overflow posible */
+    char response[512];
+    snprintf(response, sizeof(response),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: text/html\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "<html><body><h1>%d %s</h1></body></html>",
+        status, text, status, text);
+
+    write_all(fd, response, strlen(response));
 }
 
-void generate_http_response(http_request *req, http_response *res, const char *root_dir) {
-    if (!req || !res) return;
-    
-    // Inicializar respuesta
-    memset(res, 0, sizeof(http_response));
-    res->keep_alive = 0;
-    
-    // Verificar método
-    if (strcmp(req->method, "GET") != 0 && strcmp(req->method, "HEAD") != 0) {
-        res->status_code = 405;
-        strcpy(res->status_text, "Method Not Allowed");
-        strcpy(res->content_type, "text/html");
-        
-        const char *body = "<html><body><h1>405 Method Not Allowed</h1></body></html>";
-        res->body = strdup(body);
-        res->body_length = strlen(body);
-        return;
-    }
-    
-    // Verificar seguridad del path
-    if (!is_safe_path(root_dir, req->uri)) {
-        res->status_code = 403;
-        strcpy(res->status_text, "Forbidden");
-        strcpy(res->content_type, "text/html");
-        
-        const char *body = "<html><body><h1>403 Forbidden</h1></body></html>";
-        res->body = strdup(body);
-        res->body_length = strlen(body);
-        return;
-    }
-    
-    // Construir ruta completa
-    char full_path[2048];
-    if (strcmp(req->uri, "/") == 0) {
-        snprintf(full_path, sizeof(full_path), "%s/index.html", root_dir);
-    } else {
-        // Eliminar el / inicial si existe
-        const char *uri = req->uri;
-        if (uri[0] == '/') uri++;
-        snprintf(full_path, sizeof(full_path), "%s/%s", root_dir, uri);
-    }
-    
-    // Verificar si el archivo existe
-    if (!file_exists(full_path)) {
-        res->status_code = 404;
-        strcpy(res->status_text, "Not Found");
-        strcpy(res->content_type, "text/html");
-        
-        const char *body = "<html><body><h1>404 Not Found</h1></body></html>";
-        res->body = strdup(body);
-        res->body_length = strlen(body);
-        return;
-    }
-    
-    // Leer el archivo
-    file_content *fc = read_file(full_path);
-    if (!fc) {
-        res->status_code = 500;
-        strcpy(res->status_text, "Internal Server Error");
-        strcpy(res->content_type, "text/html");
-        
-        const char *body = "<html><body><h1>500 Internal Server Error</h1></body></html>";
-        res->body = strdup(body);
-        res->body_length = strlen(body);
-        return;
-    }
-    
-    // Configurar respuesta exitosa
-    res->status_code = 200;
-    strcpy(res->status_text, "OK");
-    
-    // Establecer tipo MIME
-    const char *mime = get_mime_type(full_path);
-    strcpy(res->content_type, mime);
-    
-    // Establecer cuerpo de la respuesta
-    res->body = fc->data;
-    res->body_length = fc->size;
-    
-    // Verificar si debe mantener la conexión viva
-    const char *connection = find_header(req, "Connection");
-    if (connection && strcasecmp(connection, "keep-alive") == 0) {
-        res->keep_alive = 1;
-    }
-    
-    // Liberar la estructura file_content (pero no los datos)
-    free(fc);
-}
+/* ─────────────────────────────────────────────────────────────────
+ * RESPUESTA EXITOSA
+ * ───────────────────────────────────────────────────────────────── */
 
-void free_http_response(http_response *res) {
-    if (res && res->body) {
-        free(res->body);
-        res->body = NULL;
+void http_send_response(int fd, const http_request_t *req,
+                        const char *www_root) {
+
+    /* ── Seguridad: construir la ruta completa ───────────────────── */
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s%s", www_root, req->uri);
+
+    /* realpath() resuelve '..' y symlinks → ruta absoluta real.
+     * Esto neutraliza ataques de Directory Traversal como:
+     *   GET /../../etc/passwd  →  realpath devuelve /etc/passwd */
+    char real_path[PATH_MAX];
+    if (!realpath(path, real_path)) {
+        http_send_error(fd, HTTP_404);
+        return;
     }
+
+    /* ── Seguridad: verificar que la ruta esté dentro de www_root ── */
+    char real_root[PATH_MAX];
+    if (!realpath(www_root, real_root)) {
+        http_send_error(fd, HTTP_500);
+        return;
+    }
+
+    /* Si real_path no empieza con real_root → Directory Traversal → 403 */
+    if (strncmp(real_path, real_root, strlen(real_root)) != 0) {
+        http_send_error(fd, HTTP_403);
+        return;
+    }
+
+    /* ── Si la URI apunta a un directorio, servir index.html ─────── */
+    struct stat st;
+    if (stat(real_path, &st) != 0) {
+        http_send_error(fd, HTTP_404);
+        return;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        /* strncat con espacio restante disponible — sin overflow */
+        strncat(real_path, "/index.html",
+                PATH_MAX - strlen(real_path) - 1);
+
+        /* Re-verificar que el index.html exista */
+        if (stat(real_path, &st) != 0) {
+            http_send_error(fd, HTTP_404);
+            return;
+        }
+    }
+
+    /* ── Abrir archivo con file_open() y obtener tamaño ─────────── */
+    size_t file_size = 0;
+    int file_fd = file_open(real_path, &file_size);
+    if (file_fd < 0) {
+        http_send_error(fd, HTTP_404);
+        return;
+    }
+
+    /* ── Determinar Content-Type según extensión ─────────────────── */
+    const char *mime = mime_get_type(real_path);
+
+    /* ── Conexión persistente o no ───────────────────────────────── */
+    /* HTTP/1.1 es keep-alive por defecto; cerramos solo si el cliente
+     * envió "Connection: close" explícitamente */
+    int keep_alive = (strcasecmp(req->connection, "close") != 0);
+
+    /* ── Construir y enviar headers HTTP ─────────────────────────── */
+    /* snprintf — límite estricto, garantiza \0, sin overflow */
+    char headers[512];
+    snprintf(headers, sizeof(headers),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: %s\r\n"
+        "\r\n",
+        mime,
+        file_size,
+        keep_alive ? "keep-alive" : "close");
+
+    write_all(fd, headers, strlen(headers));
+
+    /* ── Enviar cuerpo con sendfile() (zero-copy) ────────────────── */
+    /* sendfile(out_fd, in_fd, &offset, count):
+     *   - Transfiere bytes directamente de file_fd al socket fd
+     *   - Sin pasar por espacio de usuario (zero-copy)
+     *   - offset es actualizado automáticamente en cada llamada
+     *   - Puede enviar menos bytes que count, necesitamos el loop */
+    off_t  offset    = 0;
+    size_t remaining = file_size;
+
+    while (remaining > 0) {
+        ssize_t sent = sendfile(fd, file_fd, &offset, remaining);
+        if (sent <= 0) break;   /* error o cliente cerró la conexión */
+        remaining -= (size_t)sent;
+    }
+
+    /* Cerramos el fd del archivo — el socket (fd) lo gestiona server.c */
+    close(file_fd);
 }
